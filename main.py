@@ -15,6 +15,8 @@ from contextlib import suppress
 from datetime import datetime
 import models
 
+import wandb
+
 import torch
 import torch.nn as nn
 import torchvision.utils
@@ -316,6 +318,9 @@ def main():
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
     print ('Num:', count_parameters(model)/1e6)
 
+    if int(os.environ["RANK"]) == 0:
+        wandb.init(project="cswin-ode", name=f"CSwin/{args.model}")
+        
     if args.local_rank == 0:
         _logger.info('Model %s created, param count: %d' %
                      (args.model, sum([m.numel() for m in model.parameters()])))
@@ -673,6 +678,14 @@ def train_epoch(
                         rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
                         lr=lr,
                         data_time=data_time_m))
+                
+                if int(os.environ["RANK"]) == 0:
+                    wandb.log({
+                        "epoch": epoch,
+                        "Loss": loss.val,
+                        "Loss_avg": loss.avg,
+                        "LR": lr,
+                    })
 
                 if args.save_images and output_dir:
                     torchvision.utils.save_image(
@@ -756,6 +769,11 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                         log_name, batch_idx, last_idx, batch_time=batch_time_m,
                         loss=losses_m, top1=top1_m, top5=top5_m))
 
+                wandb.log({
+                    "val/Acc@1": top1_m.avg,
+                    "val/Acc@5": top5_m.avg,
+                })
+                    
     metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
 
     return metrics
