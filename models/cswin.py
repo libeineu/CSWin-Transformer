@@ -267,6 +267,7 @@ class CSWinTransformer(nn.Module):
 
         curr_dim = embed_dim
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, np.sum(depth))]  # stochastic depth decay rule
+        self.block_history1 = CreateLayerHistory(depth[0], curr_dim)
         self.stage1 = nn.ModuleList([
             CSWinBlock(
                 dim=curr_dim, num_heads=heads[0], reso=img_size//4, mlp_ratio=mlp_ratio,
@@ -277,6 +278,7 @@ class CSWinTransformer(nn.Module):
 
         self.merge1 = Merge_Block(curr_dim, curr_dim*2)
         curr_dim = curr_dim*2
+        self.block_history2 = CreateLayerHistory(depth[1], curr_dim)
         self.stage2 = nn.ModuleList(
             [CSWinBlock(
                 dim=curr_dim, num_heads=heads[1], reso=img_size//8, mlp_ratio=mlp_ratio,
@@ -287,6 +289,7 @@ class CSWinTransformer(nn.Module):
         
         self.merge2 = Merge_Block(curr_dim, curr_dim*2)
         curr_dim = curr_dim*2
+        self.block_history3 = CreateLayerHistory(depth[2], curr_dim)
         temp_stage3 = []
         temp_stage3.extend(
             [CSWinBlock(
@@ -300,6 +303,7 @@ class CSWinTransformer(nn.Module):
         
         self.merge3 = Merge_Block(curr_dim, curr_dim*2)
         curr_dim = curr_dim*2
+        self.block_history4 = CreateLayerHistory(depth[3], curr_dim)
         self.stage4 = nn.ModuleList(
             [CSWinBlock(
                 dim=curr_dim, num_heads=heads[3], reso=img_size//32, mlp_ratio=mlp_ratio,
@@ -312,7 +316,7 @@ class CSWinTransformer(nn.Module):
         # Classifier head
         self.head = nn.Linear(curr_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        self.block_history = CreateLayerHistory(self.depth, curr_dim)
+        
 
         # RK configuration
         self.calculate_num = rk_step
@@ -350,6 +354,7 @@ class CSWinTransformer(nn.Module):
     def get_classifier(self):
         return self.head
     
+    
     def reset_classifier(self, num_classes, global_pool=''):
         if self.num_classes != num_classes:
             print ('reset head to', num_classes)
@@ -363,17 +368,16 @@ class CSWinTransformer(nn.Module):
     def forward_features(self, x):
         B = x.shape[0]
         x = self.stage1_conv_embed(x)
-
-        assert self.block_history is not None
-        self.block_history.clean()
-        self.block_history.add(x)
+        
+        self.block_history1.clean()
+        self.block_history2.clean()
+        self.block_history3.clean()
+        self.block_history4.clean()
 
         for layer_idx, blk in enumerate(self.stage1):
             if self.use_chk:
                 x = checkpoint.checkpoint(blk, x)
             else:
-                x = self.block_history.pop()
-
                 runge_kutta_list = []
                 if self.rk_norm:
                     residual = self.residual_norm[layer_idx](x)
@@ -411,22 +415,39 @@ class CSWinTransformer(nn.Module):
                 else:
                     raise ValueError("invalid caculate num！")
                 
-                self.block_history.add(x)
+                self.block_history1.add(x)
+    
+                x = self.block_history1.pop()
 
-        for pre, blocks in zip([self.merge1, self.merge2, self.merge3], 
-                               [self.stage2, self.stage3, self.stage4]):
+        for layer_idx, (pre, blocks) in enumerate(zip([self.merge1, self.merge2, self.merge3], 
+                                            [self.stage2, self.stage3, self.stage4])):
+            
+            block_history_dict = {
+                '0' : self.block_history2,
+                '1' : self.block_history3,
+                '2' : self.block_history4
+            }
+
+            print(f"layer_idx:{layer_idx}")
+            block_history = block_history_dict.get(str(layer_idx))
+            print(f"block_history:{block_history}")
             x = pre(x)
             for blk in blocks:
                 if self.use_chk:
                     x = checkpoint.checkpoint(blk, x)
                 else:
-                    x = self.block_history.pop()
-
                     runge_kutta_list = []
-                    residual = x
+                    if self.rk_norm:
+                        residual = self.residual_norm[layer_idx](x)
+                    else:
+                        residual = x
                     for j in range(self.calculate_num):
                         x = blk(x)
-                        runge_kutta_list.append(x)
+                        if self.rk_norm:
+                            x = self.RK_norm[j](x)
+                            runge_kutta_list.append(x)
+                        else:
+                            runge_kutta_list.append(x)
                         if self.calculate_num == 4:
                             if j == 0 or j == 1:
                                 x = residual + 1 / 2 * x
@@ -450,9 +471,10 @@ class CSWinTransformer(nn.Module):
                     else:
                         raise ValueError("invalid caculate num！")
 
-                    self.block_history.add(x)
+                    block_history.add(x)
+                    
+                    x = block_history.pop()
 
-        x = self.block_history.pop()
         x = self.norm(x)
         return torch.mean(x, dim=1)
 

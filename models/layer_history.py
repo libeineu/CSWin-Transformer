@@ -18,8 +18,7 @@ class BaseLayerHistory(nn.Module):
         # since Swin-Transformer follows a pre-Norm Transformer backcbone.
         self.normalize_before = True
 
-        # the first layer (aka. embedding layer) does not have layer normalization
-        self.layer_norms = nn.ModuleList(LayerNorm(block_dim) for _ in range(block_depth + 1))
+        
 
     def add(self, layer):
         raise NotImplemented
@@ -39,9 +38,13 @@ class LearnableDenseLayerHistory(BaseLayerHistory):
         super(LearnableDenseLayerHistory, self).__init__(block_depth, block_dim)
         self.sum = None
         self.layer_idx = 0
-        self.layer_num = 1 + block_depth
+        self.layer_num = block_depth
         self.weight = nn.Parameter(torch.Tensor(self.layer_num, self.layer_num).fill_(1.0).tril())
         self.weight.data = self.weight.data / self.weight.data.sum(1, keepdim=True)
+        
+        # the first layer (aka. embedding layer) does not have layer normalization
+        self.layer_norms = nn.ModuleList(LayerNorm(block_dim) for _ in range(block_depth))
+
 
     def extra_repr(self):
         return 'n_layers={layer_num}, '.format(**self.__dict__)
@@ -49,6 +52,7 @@ class LearnableDenseLayerHistory(BaseLayerHistory):
     def add(self, layer):
         
         assert self.normalize_before is True, "This dlcl only supports the pre-Norm Swin Transformer"
+        
         layer = self.layer_norms[self.layer_idx](layer)
         self.layer_idx += 1
 
