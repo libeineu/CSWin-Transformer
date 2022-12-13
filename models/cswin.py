@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 
+from layer_history import CreateLayerHistory
+
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.helpers import load_pretrained
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
@@ -248,7 +250,7 @@ class CSWinTransformer(nn.Module):
     """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=96, depth=[2,2,6,2], split_size = [3,5,7],
                  num_heads=12, mlp_ratio=4., qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, use_chk=False):
+                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, use_chk=False, rk_step=2, enc_learnable_type='ema', rk_norm=False):
         super().__init__()
         self.use_chk = use_chk
         self.num_classes = num_classes
@@ -260,6 +262,8 @@ class CSWinTransformer(nn.Module):
             Rearrange('b c h w -> b (h w) c', h = img_size//4, w = img_size//4),
             nn.LayerNorm(embed_dim)
         )
+
+        self.depth = np.sum(depth)
 
         curr_dim = embed_dim
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, np.sum(depth))]  # stochastic depth decay rule
@@ -308,6 +312,26 @@ class CSWinTransformer(nn.Module):
         # Classifier head
         self.head = nn.Linear(curr_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+        self.block_history = CreateLayerHistory(self.depth, curr_dim)
+
+        # RK configuration
+        self.calculate_num = rk_step
+        self.enc_learnable_type = enc_learnable_type
+        self.rk_norm = rk_norm
+        self.RK_norm = nn.ModuleList(nn.LayerNorm(curr_dim) for _ in range(rk_step)) if self.rk_norm else None
+        self.residual_norm = nn.ModuleList(nn.LayerNorm(curr_dim) for _ in range(self.depth)) if self.rk_norm else None
+        if self.calculate_num == 2:
+            if self.enc_learnable_type == 'gated':
+                self.gate_linear = nn.Linear(2 * curr_dim, 1)
+            elif self.enc_learnable_type == 'ema':
+                self.alpha = torch.nn.Parameter(torch.Tensor(1))
+                self.alpha.data.fill_(0.5)
+        elif self.calculate_num == 4: 
+            if self.enc_learnable_type == 'ema':
+                self.alpha = torch.nn.Parameter(torch.Tensor(1))
+                self.alpha.data.fill_(0.5)
+
+
         trunc_normal_(self.head.weight, std=0.02)
         self.apply(self._init_weights)
     def _init_weights(self, m):
@@ -339,11 +363,56 @@ class CSWinTransformer(nn.Module):
     def forward_features(self, x):
         B = x.shape[0]
         x = self.stage1_conv_embed(x)
-        for blk in self.stage1:
+
+        assert self.block_history is not None
+        self.block_history.clean()
+        self.block_history.add(x)
+
+        for layer_idx, blk in enumerate(self.stage1):
             if self.use_chk:
                 x = checkpoint.checkpoint(blk, x)
             else:
-                x = blk(x)
+                x = self.block_history.pop()
+
+                runge_kutta_list = []
+                if self.rk_norm:
+                    residual = self.residual_norm[layer_idx](x)
+                else:
+                    residual = x
+                for j in range(self.calculate_num):
+                    x = blk(x)
+                    
+                    if self.rk_norm:
+                        x = self.RK_norm[j](x)
+                        runge_kutta_list.append(x)
+                    else:
+                        runge_kutta_list.append(x)
+
+                    if self.calculate_num == 4:
+                        if j == 0 or j == 1:
+                            x = residual + 1 / 2 * x
+                        elif j == 2:
+                            x = residual + x
+                    elif self.calculate_num == 2:
+                        x = residual + x
+                if self.calculate_num == 4:
+                    if self.enc_learnable_type == 'ema':
+                        x = residual + self.alpha*torch.pow(1-self.alpha,3) * runge_kutta_list[0] + self.alpha*torch.pow(1-self.alpha,2) * runge_kutta_list[1] + self.alpha*(1-self.alpha) * runge_kutta_list[2] + self.alpha*runge_kutta_list[3]
+                    else:
+                        x = residual + 1 / 6 * (runge_kutta_list[0] + 2 * runge_kutta_list[1] + 2 * runge_kutta_list[2] + runge_kutta_list[3])
+                elif self.calculate_num == 2:
+                    if self.enc_learnable_type == 'gated':
+                        alpha = torch.sigmoid(self.gate_linear(torch.cat((runge_kutta_list[0], runge_kutta_list[1]), dim=-1)))
+                        x = residual + alpha * runge_kutta_list[0] + (1 - alpha) * runge_kutta_list[1]
+                    elif self.enc_learnable_type == 'ema':
+                        x = residual + self.alpha*(1-self.alpha) * runge_kutta_list[0] + self.alpha*runge_kutta_list[1]
+                    else:
+                        x = residual + 1/2 * (runge_kutta_list[0] + runge_kutta_list[1])
+                else:
+                    raise ValueError("invalid caculate num！")
+                
+                self.block_history.add(x)
+
         for pre, blocks in zip([self.merge1, self.merge2, self.merge3], 
                                [self.stage2, self.stage3, self.stage4]):
             x = pre(x)
@@ -351,7 +420,39 @@ class CSWinTransformer(nn.Module):
                 if self.use_chk:
                     x = checkpoint.checkpoint(blk, x)
                 else:
-                    x = blk(x)
+                    x = self.block_history.pop()
+
+                    runge_kutta_list = []
+                    residual = x
+                    for j in range(self.calculate_num):
+                        x = blk(x)
+                        runge_kutta_list.append(x)
+                        if self.calculate_num == 4:
+                            if j == 0 or j == 1:
+                                x = residual + 1 / 2 * x
+                            elif j == 2:
+                                x = residual + x
+                        elif self.calculate_num == 2:
+                            x = residual + x
+                    if self.calculate_num == 4:
+                        if self.enc_learnable_type == 'ema':
+                            x = residual + self.alpha*torch.pow(1-self.alpha,3) * runge_kutta_list[0] + self.alpha*torch.pow(1-self.alpha,2) * runge_kutta_list[1] + self.alpha*(1-self.alpha) * runge_kutta_list[2] + self.alpha*runge_kutta_list[3]
+                        else:
+                            x = residual + 1 / 6 * (runge_kutta_list[0] + 2 * runge_kutta_list[1] + 2 * runge_kutta_list[2] + runge_kutta_list[3])
+                    elif self.calculate_num == 2:
+                        if self.enc_learnable_type == 'gated':
+                            alpha = torch.sigmoid(self.gate_linear(torch.cat((runge_kutta_list[0], runge_kutta_list[1]), dim=-1)))
+                            x = residual + alpha * runge_kutta_list[0] + (1 - alpha) * runge_kutta_list[1]
+                        elif self.enc_learnable_type == 'ema':
+                            x = residual + self.alpha*(1-self.alpha) * runge_kutta_list[0] + self.alpha*runge_kutta_list[1]
+                        else:
+                            x = residual + 1/2 * (runge_kutta_list[0] + runge_kutta_list[1])
+                    else:
+                        raise ValueError("invalid caculate num！")
+
+                    self.block_history.add(x)
+
+        x = self.block_history.pop()
         x = self.norm(x)
         return torch.mean(x, dim=1)
 
@@ -376,6 +477,13 @@ def _conv_filter(state_dict, patch_size=16):
 def CSWin_64_12211_tiny_224(pretrained=False, **kwargs):
     model = CSWinTransformer(patch_size=4, embed_dim=64, depth=[1,2,21,1],
         split_size=[1,2,7,7], num_heads=[2,4,8,16], mlp_ratio=4., **kwargs)
+    model.default_cfg = default_cfgs['cswin_224']
+    return model
+
+@register_model
+def Numerical_CSWin_64_12211_tiny_224(pretrained=False, **kwargs):
+    model = CSWinTransformer(patch_size=4, embed_dim=64, depth=[1,2,21,1],
+        split_size=[1,2,7,7], num_heads=[2,4,8,16], mlp_ratio=4., rk_step=2, enc_learnable_type='ema', rk_norm=False, **kwargs)
     model.default_cfg = default_cfgs['cswin_224']
     return model
 
