@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 
-from layer_history import CreateLayerHistory
+from .layer_history import CreateLayerHistory
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.helpers import load_pretrained
